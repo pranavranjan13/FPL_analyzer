@@ -1,11 +1,9 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 from pulp import *
-import requests # For fetching live FPL data
-import joblib # To simulate loading a pre-trained ML model
+import requests
+import joblib
 import os
 import random
 
@@ -18,87 +16,83 @@ FPL_BOOTSTRAP_STATIC = FPL_API_BASE_URL + "bootstrap-static/"
 FPL_FIXTURES = FPL_API_BASE_URL + "fixtures/"
 FPL_GAMEWEEK_STATUS = FPL_API_BASE_URL + "event-status/"
 
-# app.py (Modified fetch_fpl_data function again)
-
-# ... (rest of your imports and constants) ...
-
 # --- Data Fetching ---
 @st.cache_data(ttl=3600) # Cache data for 1 hour to avoid hitting API too often
 def fetch_fpl_data():
-    """Fetches general FPL data (players, teams, elements types)."""
+    """
+    Fetches general FPL data (players, teams, elements types)
+    and returns player DataFrame along with a team ID to name mapping.
+    """
     try:
         response = requests.get(FPL_BOOTSTRAP_STATIC)
-        response.raise_for_status() # Raise an exception for HTTP errors
+        response.raise_for_status()
         data = response.json()
 
         elements_df = pd.DataFrame(data['elements'])
         teams_df = pd.DataFrame(data['teams'])
-        element_types_df = pd.DataFrame(data['element_types']) # Positions
+        element_types_df = pd.DataFrame(data['element_types'])
 
+        # Rename the 'name' column in teams_df to 'team_name' *before* merging.
         teams_df_renamed = teams_df.rename(columns={'name': 'team_name'})
 
-        players_df = elements_df.merge(teams_df_renamed[['id', 'team_name']], left_on='team', right_on='id')
+        # Merge elements_df with teams_df to get team_name and also keep original team_id
+        # The 'team' column in elements_df is the team_id.
+        # Use suffixes to clearly differentiate IDs if there were conflicts, but for 'id' and 'team_name' it's fine.
+        players_df = elements_df.merge(teams_df_renamed[['id', 'team_name']], left_on='team', right_on='id', suffixes=('_player_id_dummy', '_team_id_dummy'))
+
+        # Merge for position (element_types)
         players_df = players_df.merge(element_types_df[['id', 'singular_name_short']], left_on='element_type', right_on='id', suffixes=('', '_pos'))
 
+        # Select relevant columns and rename for clarity
+        # 'id' is the player's FPL ID. 'team' is the team ID. 'team_name' is the team's full name.
         players_df = players_df[[
-            'id', 'first_name', 'second_name', 'web_name', 'now_cost',
+            'id', # This is the player's unique FPL ID from elements_df
+            'first_name', 'second_name', 'web_name', 'now_cost',
             'singular_name_short', 'team_name', 'points_per_game', 'form',
-            'status', 'total_points'
+            'status', 'total_points', 'team' # 'team' here is the original team_id from elements_df
         ]]
         players_df.columns = [
-            'id', 'first_name', 'second_name', 'name', 'cost',
-            'position', 'team', 'ppg', 'form',
-            'status', 'total_points_season'
+            'id', # Renamed to 'id' for player unique ID
+            'first_name', 'second_name', 'name', 'cost',
+            'position', 'team_name', 'ppg', 'form', # 'team_name' is the full team name
+            'status', 'total_points_season', 'team_id' # Renamed 'team' to 'team_id' for clarity
         ]
         
         # Convert cost to millions
         players_df['cost'] = players_df['cost'] / 10.0
 
-        # --- CRITICAL CHANGE HERE ---
         # Convert 'ppg' and 'form' to numeric, handling potential errors
-        # 'coerce' will turn non-numeric values into NaN
-        players_df['ppg'] = pd.to_numeric(players_df['ppg'], errors='coerce')
-        players_df['form'] = pd.to_numeric(players_df['form'], errors='coerce')
-
-        # Fill NaN values with 0 or a sensible default if any occur after conversion
-        # This prevents issues if some players have missing form/ppg data
-        players_df['ppg'].fillna(0.0, inplace=True)
-        players_df['form'].fillna(0.0, inplace=True)
-
+        players_df['ppg'] = pd.to_numeric(players_df['ppg'], errors='coerce').fillna(0.0)
+        players_df['form'] = pd.to_numeric(players_df['form'], errors='coerce').fillna(0.0)
 
         # Filter out unavailable players (injured, suspended, etc.) for initial selection
         players_df['is_available_for_selection'] = ~players_df['status'].isin(['i', 'n', 's'])
 
+        # Create a team ID to name mapping (and name to ID mapping for convenience)
+        team_id_to_name = {team['id']: team['name'] for team in data['teams']}
+        
         st.success(f"Successfully fetched FPL data for {len(players_df)} players.")
-        return players_df[players_df['is_available_for_selection']].copy()
+        return players_df[players_df['is_available_for_selection']].copy(), team_id_to_name
     except requests.exceptions.RequestException as e:
         st.error(f"Error fetching FPL data: {e}. Please try again later.")
-        return pd.DataFrame()
-
-
+        return pd.DataFrame(), {}
 
 @st.cache_data(ttl=3600)
 def fetch_fpl_fixtures():
-    """Fetches current and future FPL fixtures."""
+    """
+    Fetches current and future FPL fixtures.
+    Returns raw fixture data with team_h and team_a IDs.
+    """
     try:
         response = requests.get(FPL_FIXTURES)
         response.raise_for_status()
         fixtures_data = response.json()
         
-        # Convert to DataFrame
-        fixtures_df = pd.DataFrame(fixtures_data)
-        
-        # For simplicity, let's just get unique teams per gameweek for DGW/BGW detection
-        gw_fixtures = {}
-        for gw in fixtures_df['event'].unique():
-            if pd.notna(gw):
-                gw_fixtures[int(gw)] = fixtures_df[fixtures_df['event'] == gw].to_dict('records')
-        
-        st.success(f"Successfully fetched fixture data up to GW {max(gw_fixtures.keys()) if gw_fixtures else 0}.")
-        return gw_fixtures
+        st.success(f"Successfully fetched fixture data.")
+        return fixtures_data
     except requests.exceptions.RequestException as e:
         st.error(f"Error fetching fixture data: {e}. Some chip advice may be unavailable.")
-        return {}
+        return []
 
 @st.cache_data(ttl=600) # Cache for 10 minutes
 def fetch_current_gameweek():
@@ -122,61 +116,24 @@ def fetch_current_gameweek():
         return 1
 
 # --- Player Prediction (Simulated ML Model) ---
-# In a real app, this would be a loaded joblib/pickle file from your ML training
-# For this demo, we'll create a dummy 'model' that calculates predicted points.
-
-# Let's simulate a very simple "model" for player prediction
 class SimpleFPLPredictor:
     def predict(self, df):
-        # A more sophisticated model would use features like:
-        # - df['ppg'] (points per game)
-        # - df['form']
-        # - df['opponent_difficulty'] (derived from fixture data)
-        # - df['minutes_played_last_x_games']
-        # - df['xg_per_90'], df['xa_per_90'] (from external sources like Understat)
-        # - df['goals_conceded_by_team']
-
-        # For this demo, let's use a combination of cost, form, and ppg
-        # and add some randomness to simulate real world variance
-        
-        # Basic prediction formula
         df['predicted_points'] = (df['cost'] * 0.5 + df['form'].astype(float) * 1.5 + df['ppg'].astype(float) * 0.8)
-
-        # Add some random noise for realism and to differentiate players
         df['predicted_points'] = df['predicted_points'] + np.random.normal(0, 1.5, len(df))
-
-        # Ensure points are non-negative and cap at a reasonable max
         df['predicted_points'] = df['predicted_points'].apply(lambda x: max(0, min(x, 20))).round(1)
         return df['predicted_points']
 
-# Simulate loading a pre-trained model
-@st.cache_resource # Cache the model object itself
+@st.cache_resource
 def load_prediction_model():
-    # In a real scenario, you'd load a model saved like this:
-    # try:
-    #     model = joblib.load('models/player_predictor.pkl')
-    #     st.sidebar.success("Loaded pre-trained ML model.")
-    #     return model
-    # except FileNotFoundError:
-    #     st.sidebar.warning("ML model not found. Using simple heuristic.")
-    #     return SimpleFPLPredictor() # Fallback
-    
-    # For this demo, always use our simple predictor
     st.sidebar.info("Using a simplified player prediction model for this demo.")
     return SimpleFPLPredictor()
 
 # --- Team Optimization (PuLP) ---
-@st.cache_data(show_spinner="Optimizing your dream team...", experimental_allow_widgets=True) # allow_widgets for button inside cached function
+@st.cache_data(show_spinner="Optimizing your dream team...", experimental_allow_widgets=True)
 def optimize_team(players_df, budget=100.0):
-    """
-    Uses PuLP to find the optimal 15-player FPL squad based on predicted points,
-    budget, and FPL rules.
-    """
     if players_df.empty:
         return pd.DataFrame(), 0, 0, "No Data"
 
-    # Filter out players that might be injured long-term or suspended
-    # 'status' column from FPL API: 'a' (available), 'd' (doubtful), 'i' (injured), 'n' (unavailable), 's' (suspended)
     eligible_players = players_df[players_df['status'].isin(['a', 'd'])].copy()
 
     if eligible_players.empty:
@@ -195,8 +152,8 @@ def optimize_team(players_df, budget=100.0):
     prob += lpSum(player_vars[i] for i in eligible_players.index if eligible_players.loc[i, 'position'] == 'MID') == 5, "Midfielders"
     prob += lpSum(player_vars[i] for i in eligible_players.index if eligible_players.loc[i, 'position'] == 'FWD') == 3, "Forwards"
 
-    for team in eligible_players['team'].unique():
-        prob += lpSum(player_vars[i] for i in eligible_players.index if eligible_players.loc[i, 'team'] == team) <= 3, f"Max 3 Players from {team}"
+    for team_name in eligible_players['team_name'].unique():
+        prob += lpSum(player_vars[i] for i in eligible_players.index if eligible_players.loc[i, 'team_name'] == team_name) <= 3, f"Max 3 Players from {team_name}"
 
     prob.solve(PULP_CBC_CMD(msg=0))
 
@@ -212,42 +169,47 @@ def optimize_team(players_df, budget=100.0):
         return pd.DataFrame(), 0, 0, LpStatus[prob.status]
 
 # --- Chip Strategy (Heuristic Logic) ---
-def predict_team_gw_points(team_df, gameweek_fixtures, current_gameweek):
+def predict_team_gw_points(team_df, fpl_fixtures_raw, current_gameweek):
     """
     Estimates team points for a given gameweek based on predicted points.
     Considers if a player's team has a fixture in the given GW.
     """
     total_points = 0
     
-    # Get all teams playing in the target gameweek
-    teams_playing_in_target_gw = {f['team'] for f in gameweek_fixtures.get(current_gameweek, [])}
+    # Filter fixtures for the current gameweek
+    current_gw_fixtures_list = [f for f in fpl_fixtures_raw if f.get('event') == current_gameweek]
+
+    teams_playing_in_current_gw_ids = set()
+    dgw_teams_in_current_gw_ids = set()
+
+    for fixture in current_gw_fixtures_list:
+        if not fixture.get('finished', True): # Only consider unfinished games
+            teams_playing_in_current_gw_ids.add(fixture['team_h'])
+            teams_playing_in_current_gw_ids.add(fixture['team_a'])
+            if fixture.get('double_gameweek', False):
+                dgw_teams_in_current_gw_ids.add(fixture['team_h'])
+                dgw_teams_in_current_gw_ids.add(fixture['team_a'])
     
-    # Identify DGW teams for the current gameweek
-    dgw_teams_in_target_gw = {f['team'] for f in gameweek_fixtures.get(current_gameweek, []) if f.get('is_double_gameweek', False)}
-
-
-    # Sort by predicted points to simulate starting XI
     team_df_sorted = team_df.sort_values(by='predicted_points', ascending=False)
     
     for idx, player in team_df_sorted.iterrows():
-        # Check if the player's real team name has a fixture in this gameweek
-        player_has_fixture = player['team'] in teams_playing_in_target_gw
+        player_team_id = player['team_id']
+        
+        player_has_fixture = player_team_id in teams_playing_in_current_gw_ids
         
         estimated_gw_points = 0
         if player_has_fixture:
-            # Base points from prediction
-            estimated_gw_points = player['predicted_points'] * random.uniform(0.7, 1.3) # Add some variability
+            estimated_gw_points = player['predicted_points'] * random.uniform(0.7, 1.3)
 
-            # If it's a DGW for this player's team, double the potential points (rough estimate)
-            if player['team'] in dgw_teams_in_target_gw:
+            if player_team_id in dgw_teams_in_current_gw_ids:
                 estimated_gw_points *= 2 
         
-        # Accumulate points for the top 11
         total_points += estimated_gw_points
             
     return round(total_points, 1)
 
-def recommend_chip_strategy(current_team_df, current_gameweek, fpl_fixtures):
+
+def recommend_chip_strategy(current_team_df, current_gameweek, fpl_fixtures_raw, team_id_to_name):
     """
     Provides heuristic recommendations for FPL chip usage.
     Uses actual fixture data to identify DGW/BGWs.
@@ -255,52 +217,56 @@ def recommend_chip_strategy(current_team_df, current_gameweek, fpl_fixtures):
     recommendations = []
     
     next_gameweek = current_gameweek + 1
-    if next_gameweek > 38: # Season usually has 38 gameweeks
+    if next_gameweek > 38:
         recommendations.append("Season is likely over. No more chip recommendations.")
         return recommendations
 
-    # Get fixture info for next GW
-    next_gw_fixtures_list = fpl_fixtures.get(next_gameweek, [])
+    # Filter fixtures for the next gameweek and extract participating team IDs
+    next_gw_fixtures_list = [f for f in fpl_fixtures_raw if f.get('event') == next_gameweek]
+
+    teams_with_fixture_next_gw_ids = set()
+    dgw_teams_next_gw_ids = set()
+    for fixture in next_gw_fixtures_list:
+        if not fixture.get('finished', True): # Only consider unfinished games
+            teams_with_fixture_next_gw_ids.add(fixture['team_h']) # CORRECT: Uses team_h
+            teams_with_fixture_next_gw_ids.add(fixture['team_a']) # CORRECT: Uses team_a
+            if fixture.get('double_gameweek', False):
+                dgw_teams_next_gw_ids.add(fixture['team_h'])
+                dgw_teams_next_gw_ids.add(fixture['team_a'])
+
+    current_team_player_team_ids = set(current_team_df['team_id'].unique())
     
-    # Determine DGW/BGW status for the next gameweek
-    all_teams_in_league = current_team_df['team'].unique() # Assuming selected team has PL teams
-    teams_with_fixture_next_gw = {f['team'] for f in next_gw_fixtures_list if not f.get('finished', True)} # Only count unfinished games
-    is_next_dgw = any(f.get('double_gameweek', False) for f in next_gw_fixtures_list) # Check if any fixture is part of a DGW
-    is_next_bgw = len(all_teams_in_league.difference(teams_with_fixture_next_gw)) > 0 # Any team without a fixture
+    is_next_bgw = len(current_team_player_team_ids.difference(teams_with_fixture_next_gw_ids)) > 0
+    
+    is_next_dgw = bool(dgw_teams_next_gw_ids)
 
     # --- Wildcard ---
-    # Heuristic: Suggest if current team's average predicted points is low (relative value)
-    # A more advanced check would be: if 6+ players are injured/suspended, or team value dropped significantly.
     avg_predicted_points_current_team = current_team_df['predicted_points'].mean()
-    if avg_predicted_points_current_team < 4.5: # Arbitrary threshold
+    if avg_predicted_points_current_team < 4.5:
         recommendations.append("🚨 **Wildcard:** Your current squad's average predicted performance is low. Consider playing your Wildcard to rebuild for future gameweeks!")
 
     # --- Free Hit ---
-    players_without_fixture_count = len(current_team_df[~current_team_df['team'].isin(teams_with_fixture_next_gw)])
+    players_without_fixture_count = len(current_team_df[~current_team_df['team_id'].isin(teams_with_fixture_next_gw_ids)])
 
-    if is_next_bgw and players_without_fixture_count >= 5: # If 5 or more players have no fixture
+    if is_next_bgw and players_without_fixture_count >= 5:
         recommendations.append(f"🔥 **Free Hit:** Gameweek {next_gameweek} is a Blank Gameweek for many of your players ({players_without_fixture_count} without fixture). A Free Hit could maximize your points this GW without permanent changes.")
     elif is_next_dgw:
-        dgw_teams_in_fixtures = {f['team'] for f in next_gw_fixtures_list if f.get('double_gameweek', False)}
-        players_from_dgw_teams = current_team_df[current_team_df['team'].isin(dgw_teams_in_fixtures)].shape[0]
-        if players_from_dgw_teams < 5: # If fewer than 5 DGW players in current squad
+        players_from_dgw_teams = current_team_df[current_team_df['team_id'].isin(dgw_teams_next_gw_ids)].shape[0]
+        if players_from_dgw_teams < 5:
              recommendations.append(f"🔥 **Free Hit:** Gameweek {next_gameweek} is a Double Gameweek. Your current team might not have enough DGW players. A Free Hit could allow you to load up on key DGW assets temporarily.")
 
     # --- Triple Captain ---
     if is_next_dgw:
-        # Find players in your current team whose teams have a DGW
-        dgw_teams_next_gw = {f['team'] for f in next_gw_fixtures_list if f.get('double_gameweek', False)}
-        potential_tc_players = current_team_df[current_team_df['team'].isin(dgw_teams_next_gw)]
+        potential_tc_players = current_team_df[current_team_df['team_id'].isin(dgw_teams_next_gw_ids)]
         
         if not potential_tc_players.empty:
             best_tc_candidate = potential_tc_players.sort_values(by='predicted_points', ascending=False).iloc[0]
-            recommendations.append(f"⭐ **Triple Captain:** Consider Triple Captaining **{best_tc_candidate['name']} ({best_tc_candidate['team']})** in Gameweek {next_gameweek}. They are predicted to score high and have a Double Gameweek!")
+            recommendations.append(f"⭐ **Triple Captain:** Consider Triple Captaining **{best_tc_candidate['name']} ({best_tc_candidate['team_name']})** in Gameweek {next_gameweek}. They are predicted to score high and have a Double Gameweek!")
 
     # --- Bench Boost ---
     if is_next_dgw:
-        # Check if all 15 players have a fixture and decent predicted points
-        all_players_have_fixture = current_team_df['team'].isin(teams_with_fixture_next_gw).all()
-        if all_players_have_fixture and current_team_df['predicted_points'].min() > 3.0: # All players have decent prospects
+        all_players_have_fixture = current_team_df['team_id'].isin(teams_with_fixture_next_gw_ids).all()
+        if all_players_have_fixture and current_team_df['predicted_points'].min() > 3.0:
              recommendations.append(f"📈 **Bench Boost:** Gameweek {next_gameweek} is a Double Gameweek and all your 15 players look strong with fixtures. Consider playing your Bench Boost to maximize points!")
     
     if not recommendations:
@@ -324,12 +290,12 @@ col1, col2 = st.columns([1, 2])
 # --- Sidebar for Data Loading & Settings ---
 st.sidebar.header("🛠️ Data & Model")
 st.sidebar.info("Data is cached for 1 hour to reduce API calls.")
-players_df_full = fetch_fpl_data()
-fpl_fixtures = fetch_fpl_fixtures()
+players_df_full, team_id_to_name_map = fetch_fpl_data()
+fpl_fixtures_raw = fetch_fpl_fixtures()
 current_fpl_gameweek = fetch_current_gameweek()
 
 if players_df_full.empty:
-    st.stop() # Stop if data fetching failed
+    st.stop()
 
 # Load the prediction model (or simulate it)
 prediction_model = load_prediction_model()
@@ -364,10 +330,9 @@ with col2:
             st.metric("Total Predicted Points (Approx.)", f"{total_predicted_points:.1f}")
             st.metric("Total Cost", f"£{total_cost:.1f}M")
             
-            # Display the selected team
             st.subheader("Your Recommended 15-Player Squad")
             st.dataframe(selected_team_df[[
-                'name', 'team', 'position', 'cost', 'predicted_points', 'form', 'ppg', 'status'
+                'name', 'team_name', 'position', 'cost', 'predicted_points', 'form', 'ppg', 'status'
             ]].sort_values(by=['position', 'predicted_points'], ascending=[True, False])
             .reset_index(drop=True)
             .style.format({'cost': "£{:.1f}M", 'predicted_points': "{:.1f}", 'ppg': "{:.1f}", 'form': "{:.1f}"}),
@@ -375,7 +340,6 @@ with col2:
             
             st.info("Remember to manually select your starting XI and captain in the FPL app!")
             
-            # Store selected_team_df in session_state for chip advice
             st.session_state['current_optimal_team'] = selected_team_df
 
         else:
@@ -389,6 +353,6 @@ with col2:
             st.warning("Please generate an optimal team first to get personalized chip advice based on a specific squad.")
         else:
             current_squad_for_advice = st.session_state['current_optimal_team']
-            chip_advice = recommend_chip_strategy(current_squad_for_advice, gameweek_for_advice, fpl_fixtures)
+            chip_advice = recommend_chip_strategy(current_squad_for_advice, gameweek_for_advice, fpl_fixtures_raw, team_id_to_name_map)
             for advice in chip_advice:
                 st.markdown(f"- {advice}")
