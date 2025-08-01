@@ -1,0 +1,7 @@
+# requirements.txt
+streamlit
+pandas
+pulp
+scikit-learn # Still a placeholder, but essential for real ML
+numpy
+requests
